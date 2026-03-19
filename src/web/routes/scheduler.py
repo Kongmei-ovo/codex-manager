@@ -39,7 +39,12 @@ async def get_cpa_scheduler_config():
 @router.get("/logs")
 async def get_system_logs(since_id: int = 0):
     """获取后台产生的进度系统日志"""
-    from ...core.scheduler import system_logs
+    from ...core.scheduler import system_logs, global_log_counter
+    
+    # 如果前端请求的游标超出了当前服务器计数（通常由于你刚刚在终端重启了脚本导致内存清空），我们将它重置为从头开始拿
+    if since_id > global_log_counter:
+        since_id = 0
+        
     # 这里我们只取从 since_id 后产生的新日志
     logs = [item for item in system_logs if item["id"] > since_id]
     last_id = logs[-1]["id"] if logs else since_id
@@ -76,8 +81,8 @@ async def trigger_cpa_scheduler_check():
     manual_logs = []
     try:
         loop = asyncio.get_event_loop()
-        # We run it in executor, but wait for it.
-        await loop.run_in_executor(None, check_cpa_services_job, manual_logs)
+        # 在线程池中执行，并正确传入 manual_logs 参数。
+        await loop.run_in_executor(None, check_cpa_services_job, None, manual_logs)
         return {"success": True, "logs": manual_logs, "message": "检查执行完毕！"}
     except Exception as e:
         return {"success": False, "logs": manual_logs, "message": str(e)}

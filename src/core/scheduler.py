@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import uuid
 from typing import Any, List, Optional
@@ -64,10 +65,117 @@ def fetch_cliproxy_auth_files(api_url: str, api_token: str) -> List[dict]:
     return files
 
 
+def _decode_possible_json_payload(payload: Any) -> Any:
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return payload
+        try:
+            return json.loads(text)
+        except Exception:
+            return payload
+    return payload
+
+
+def _extract_rate_limit_reason(rate_info: Any, key: str) -> Optional[str]:
+    if not isinstance(rate_info, dict):
+        return None
+    allowed = rate_info.get("allowed")
+    limit_reached = rate_info.get("limit_reached")
+    if allowed is False or limit_reached is True:
+        return f"{key}: allowed={allowed}, limit_reached={limit_reached}"
+    return None
+
+
+def _extract_cliproxy_failure_reason(payload: Any) -> Optional[str]:
+    data = _decode_possible_json_payload(payload)
+
+    if isinstance(data, str):
+        for keyword in (
+            "usage_limit_reached",
+            "account_deactivated",
+            "insufficient_quota",
+            "invalid_api_key",
+            "unsupported_region",
+        ):
+            if keyword in data:
+                return f"type: {keyword}"
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    error = data.get("error")
+    if isinstance(error, dict):
+        err_type = error.get("type")
+        if err_type:
+            return f"type: {err_type}"
+        message = error.get("message")
+        if message:
+            return str(message)
+
+    for key in ("rate_limit", "code_review_rate_limit"):
+        reason = _extract_rate_limit_reason(data.get(key), key)
+        if reason:
+            return reason
+
+    additional_rate_limits = data.get("additional_rate_limits")
+    if isinstance(additional_rate_limits, list):
+        for index, rate_info in enumerate(additional_rate_limits):
+            reason = _extract_rate_limit_reason(
+                rate_info,
+                f"additional_rate_limits[{index}]",
+            )
+            if reason:
+                return reason
+    elif isinstance(additional_rate_limits, dict):
+        for key, rate_info in additional_rate_limits.items():
+            reason = _extract_rate_limit_reason(
+                rate_info,
+                f"additional_rate_limits.{key}",
+            )
+            if reason:
+                return reason
+
+    for key in ("data", "body", "response", "text", "content", "status_message"):
+        reason = _extract_cliproxy_failure_reason(data.get(key))
+        if reason:
+            return reason
+
+    data_str = json.dumps(data, ensure_ascii=False)
+    for keyword in (
+        "usage_limit_reached",
+        "account_deactivated",
+        "insufficient_quota",
+        "invalid_api_key",
+        "unsupported_region",
+    ):
+        if keyword in data_str:
+            return f"type: {keyword}"
+
+    return None
+
+
+def _extract_cliproxy_item_failure_reason(item: dict) -> Optional[str]:
+    reason = _extract_cliproxy_failure_reason(item.get("status_message"))
+    if item.get("unavailable") is True:
+        return f"unavailable ({reason or item.get('status') or 'unknown'})"
+
+    status = str(item.get("status") or "").strip().lower()
+    if status in {"invalid", "disabled"}:
+        return f"status={status}"
+
+    return reason
+
+
 def test_cliproxy_auth_file(item: dict, api_url: str, api_token: str) -> tuple[bool, str]:
     auth_index = item.get("auth_index")
     if not auth_index:
         return False, "missing auth_index"
+
+    item_failure_reason = _extract_cliproxy_item_failure_reason(item)
+    if item_failure_reason:
+        return False, item_failure_reason
 
     account_id = _extract_cliproxy_account_id(item)
     call_header: dict = {
@@ -119,8 +227,12 @@ def test_cliproxy_auth_file(item: dict, api_url: str, api_token: str) -> tuple[b
     status_code = data.get("status_code")
     if not isinstance(status_code, int):
         return False, "missing status_code"
-    if status_code == 401:
-        return False, "status_code=401"
+
+    failure_reason = _extract_cliproxy_failure_reason(data)
+    if status_code >= 400 or failure_reason:
+        suffix = f" - {failure_reason}" if failure_reason else ""
+        return False, f"status_code={status_code}{suffix}"
+
     return True, f"status_code={status_code}"
 
 
@@ -187,11 +299,24 @@ async def trigger_auto_registration(count: int, cpa_service_id: int):
     )
 
 
+_is_checking = False
+
 def check_cpa_services_job(main_loop, manual_logs: list = None):
     """定时检查所有启用的 CPA 服务"""
+    global _is_checking
     settings = get_settings()
     if not settings.cpa_auto_check_enabled and manual_logs is None: # if manual trigger, ignore enabled flag
         return
+
+    if _is_checking:
+        msg = "当前已有一个检查任务在运行，本次并发请求将被跳过。"
+        if manual_logs is not None:
+            manual_logs.append(f"[WARNING] {msg}")
+            # only inject system log if triggered manually to not pollute too much
+            append_system_log("warning", msg)
+        return
+        
+    _is_checking = True
 
     def _log(msg: str, level: str = 'info'):
         log_func = getattr(logger, level, logger.info)
@@ -239,6 +364,10 @@ def check_cpa_services_job(main_loop, manual_logs: list = None):
                         invalid_count = 0
                         total_files = len(files)
                         for i, item in enumerate(files, 1):
+                            if not get_settings().cpa_auto_check_enabled and manual_logs is None:
+                                _log("任务参数已被手动修改为停止，中止并退出当前检查...", 'warning')
+                                return
+
                             if settings.cpa_auto_check_sleep_seconds > 0:
                                 import time
                                 time.sleep(settings.cpa_auto_check_sleep_seconds)
@@ -297,6 +426,8 @@ def check_cpa_services_job(main_loop, manual_logs: list = None):
         
     except Exception as e:
         _log(f"定时检查 CPA 任务异常: {e}", 'error')
+    finally:
+        _is_checking = False
 
 
 async def _scheduler_loop():
