@@ -52,7 +52,7 @@ def test_test_cliproxy_auth_file_marks_rate_limited_response_invalid(monkeypatch
     )
 
     assert success is False
-    assert "rate_limit" in message
+    assert "周限额已耗尽" in message
     assert calls[0]["url"] == "https://cpa.example.com/v0/management/api-call"
     assert calls[0]["kwargs"]["json"]["header"]["Chatgpt-Account-Id"] == "acct-123"
 
@@ -88,8 +88,8 @@ def test_test_cliproxy_auth_file_marks_low_remaining_weekly_quota_invalid(monkey
     )
 
     assert success is False
-    assert "remaining_percent=19" in message
-    assert "threshold=20" in message
+    assert "周限额剩余 19%" in message
+    assert "低于阈值 20%" in message
 
 
 def test_test_cliproxy_auth_file_allows_low_remaining_quota_when_threshold_disabled(monkeypatch):
@@ -146,6 +146,7 @@ def test_test_cliproxy_auth_file_marks_unavailable_item_invalid(monkeypatch):
 
     assert success is False
     assert "unavailable" in message
+    assert "周限额已耗尽" in message
     assert "usage_limit_reached" in message
 
 
@@ -166,3 +167,16 @@ def test_trigger_cpa_scheduler_check_passes_manual_logs_correctly(monkeypatch):
 
     assert result["success"] is True
     assert result["logs"] == ["[INFO] 手动检查已执行"]
+
+
+def test_describe_cliproxy_failure_distinguishes_weekly_quota_cases():
+    assert (
+        scheduler_core._describe_cliproxy_failure("周限额剩余 19%，低于阈值 20%")
+        == "周限额低于阈值"
+    )
+    assert (
+        scheduler_core._describe_cliproxy_failure(
+            "unavailable (周限额已耗尽 (usage_limit_reached))"
+        )
+        == "周限额已耗尽"
+    )

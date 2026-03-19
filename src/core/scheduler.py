@@ -26,6 +26,13 @@ def append_system_log(level: str, msg: str):
     system_logs.append({"id": global_log_counter, "level": level, "msg": f"[系统自动任务] {msg}"})
 
 DEFAULT_CLIPROXY_UA = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+KNOWN_CLIPROXY_ERROR_LABELS = {
+    "usage_limit_reached": "周限额已耗尽",
+    "account_deactivated": "账号已停用",
+    "insufficient_quota": "额度不足",
+    "invalid_api_key": "凭证无效",
+    "unsupported_region": "地区不支持",
+}
 
 
 def _extract_cpa_error(response) -> str:
@@ -99,6 +106,13 @@ def _format_percent(value: float) -> str:
     return f"{normalized:.2f}".rstrip("0").rstrip(".")
 
 
+def _format_known_cliproxy_error(error_type: str) -> str:
+    label = KNOWN_CLIPROXY_ERROR_LABELS.get(error_type)
+    if label:
+        return f"{label} ({error_type})"
+    return f"错误类型: {error_type}"
+
+
 def _extract_rate_limit_reason(
     rate_info: Any,
     key: str,
@@ -109,14 +123,19 @@ def _extract_rate_limit_reason(
     allowed = rate_info.get("allowed")
     limit_reached = rate_info.get("limit_reached")
     if allowed is False or limit_reached is True:
-        return f"{key}: allowed={allowed}, limit_reached={limit_reached}"
+        label_map = {
+            "rate_limit": "周限额已耗尽",
+            "code_review_rate_limit": "代码审查周限额已耗尽",
+        }
+        label = label_map.get(key, f"{key} 已耗尽")
+        return f"{label}（allowed={allowed}, limit_reached={limit_reached}）"
 
     if key == "rate_limit" and min_remaining_weekly_percent > 0:
         remaining_percent = _extract_remaining_percent(rate_info.get("primary_window"))
         if remaining_percent is not None and remaining_percent < min_remaining_weekly_percent:
             return (
-                f"{key}: remaining_percent={_format_percent(remaining_percent)}"
-                f" < threshold={min_remaining_weekly_percent}"
+                f"周限额剩余 {_format_percent(remaining_percent)}%，"
+                f"低于阈值 {min_remaining_weekly_percent}%"
             )
     return None
 
@@ -136,7 +155,7 @@ def _extract_cliproxy_failure_reason(
             "unsupported_region",
         ):
             if keyword in data:
-                return f"type: {keyword}"
+                return _format_known_cliproxy_error(keyword)
         return None
 
     if not isinstance(data, dict):
@@ -146,7 +165,7 @@ def _extract_cliproxy_failure_reason(
     if isinstance(error, dict):
         err_type = error.get("type")
         if err_type:
-            return f"type: {err_type}"
+            return _format_known_cliproxy_error(err_type)
         message = error.get("message")
         if message:
             return str(message)
@@ -198,7 +217,7 @@ def _extract_cliproxy_failure_reason(
         "unsupported_region",
     ):
         if keyword in data_str:
-            return f"type: {keyword}"
+            return _format_known_cliproxy_error(keyword)
 
     return None
 
@@ -219,6 +238,17 @@ def _extract_cliproxy_item_failure_reason(
         return f"status={status}"
 
     return reason
+
+
+def _describe_cliproxy_failure(msg: str) -> str:
+    text = str(msg or "")
+    if "低于阈值" in text:
+        return "周限额低于阈值"
+    if "周限额已耗尽" in text or "usage_limit_reached" in text:
+        return "周限额已耗尽"
+    if "代码审查周限额已耗尽" in text:
+        return "代码审查周限额已耗尽"
+    return "失效"
 
 
 def test_cliproxy_auth_file(item: dict, api_url: str, api_token: str) -> tuple[bool, str]:
@@ -445,7 +475,11 @@ def check_cpa_services_job(main_loop, manual_logs: list = None):
                                     valid_count += 1
                                     _log(f"测活进度 [{i}/{total_files}]: 凭证 {name} 状态正常")
                                 else:
-                                    _log(f"测活进度 [{i}/{total_files}]: 凭证 {name} 失效 ({msg})，正在剔除...", 'warning')
+                                    failure_desc = _describe_cliproxy_failure(msg)
+                                    _log(
+                                        f"测活进度 [{i}/{total_files}]: 凭证 {name} {failure_desc} ({msg})，正在剔除...",
+                                        'warning',
+                                    )
                                     try:
                                         delete_cliproxy_auth_file(name, svc.api_url, svc.api_token)
                                         invalid_count += 1
